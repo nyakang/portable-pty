@@ -31,6 +31,10 @@ resolver = "2"
 name = "portable_pty"
 path = "src/lib.rs"
 
+[[test]]
+name = "conpty_backend"
+path = "tests/conpty_backend.rs"
+
 [[example]]
 name = "bash"
 path = "examples/bash.rs"

@@ -3,14 +3,14 @@ use crate::cmdbuilder::CommandBuilder;
 use crate::win::procthreadattr::ProcThreadAttributeList;
 use anyhow::{bail, ensure, Error};
 use filedescriptor::{FileDescriptor, OwnedHandle};
-use lazy_static::lazy_static;
 use shared_library::shared_library;
 use std::ffi::OsString;
 use std::io::Error as IoError;
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
-use std::path::Path;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::{mem, ptr};
 use winapi::shared::minwindef::DWORD;
 use winapi::shared::winerror::{HRESULT, S_OK};
@@ -42,29 +42,114 @@ shared_library!(ConPtyFuncs,
     pub fn ClosePseudoConsole(hpc: HPCON),
 );
 
-fn load_conpty() -> ConPtyFuncs {
-    // If the kernel doesn't export these functions then their system is
-    // too old and we cannot run.
-    let kernel = ConPtyFuncs::open(Path::new("kernel32.dll")).expect(
-        "this system does not support conpty.  Windows 10 October 2018 or newer is required",
-    );
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConptyBackend {
+    Bundled,
+    System,
+}
 
-    // We prefer to use a sideloaded conpty.dll and openconsole.exe host deployed
-    // alongside the application.  We check for this after checking for kernel
-    // support so that we don't try to proceed and do something crazy.
-    if let Ok(sideloaded) = ConPtyFuncs::open(Path::new("conpty.dll")) {
-        sideloaded
-    } else {
-        kernel
+#[derive(Clone, Debug)]
+pub struct ConptyStatus {
+    pub active_bundled: usize,
+    pub active_system: usize,
+    pub last_used: Option<ConptyBackend>,
+    pub fallback_reason: Option<String>,
+}
+
+struct ConptyState {
+    system: ConPtyFuncs,
+    bundled: Option<ConPtyFuncs>,
+    bundled_disabled: AtomicBool,
+    active_bundled: AtomicUsize,
+    active_system: AtomicUsize,
+    last_used: AtomicU8,
+    fallback_reason: Mutex<Option<String>>,
+}
+
+static BUNDLED_PATH: OnceLock<PathBuf> = OnceLock::new();
+static CONPTY: OnceLock<ConptyState> = OnceLock::new();
+
+pub fn configure_bundled_conpty(path: PathBuf) -> Result<(), &'static str> {
+    if !path.is_absolute() {
+        return Err("bundled ConPTY path must be absolute");
+    }
+    if CONPTY.get().is_some() {
+        return Err("ConPTY was already initialized");
+    }
+    BUNDLED_PATH
+        .set(path)
+        .map_err(|_| "bundled ConPTY path was already configured")
+}
+
+pub fn conpty_status() -> ConptyStatus {
+    let Some(state) = CONPTY.get() else {
+        return ConptyStatus {
+            active_bundled: 0,
+            active_system: 0,
+            last_used: None,
+            fallback_reason: None,
+        };
+    };
+    let last_used = match state.last_used.load(Ordering::Acquire) {
+        1 => Some(ConptyBackend::Bundled),
+        2 => Some(ConptyBackend::System),
+        _ => None,
+    };
+    ConptyStatus {
+        active_bundled: state.active_bundled.load(Ordering::Acquire),
+        active_system: state.active_system.load(Ordering::Acquire),
+        last_used,
+        fallback_reason: state.fallback_reason.lock().unwrap().clone(),
     }
 }
 
-lazy_static! {
-    static ref CONPTY: ConPtyFuncs = load_conpty();
+fn load_conpty() -> ConptyState {
+    let system = ConPtyFuncs::open(Path::new("kernel32.dll")).expect(
+        "this system does not support conpty.  Windows 10 October 2018 or newer is required",
+    );
+    let (bundled, fallback_reason) = match BUNDLED_PATH.get() {
+        Some(path) => {
+            let host_arches: &[&str] = match std::env::consts::ARCH {
+                "x86_64" => &["x64", "arm64"],
+                "aarch64" => &["arm64"],
+                "x86" => &["x86", "x64", "arm64"],
+                _ => &[],
+            };
+            let missing_host = host_arches.iter().find_map(|arch| {
+                let host = path.parent()?.join(arch).join("OpenConsole.exe");
+                (!host.is_file()).then_some(host)
+            });
+            if let Some(host) = missing_host {
+                (
+                    None,
+                    Some(format!(
+                        "Bundled ConPTY host is missing: {}",
+                        host.display()
+                    )),
+                )
+            } else {
+                match ConPtyFuncs::open(path) {
+                    Ok(funcs) => (Some(funcs), None),
+                    Err(error) => (None, Some(format!("Bundled ConPTY load failed: {error:?}"))),
+                }
+            }
+        }
+        None => (None, None),
+    };
+    ConptyState {
+        system,
+        bundled,
+        bundled_disabled: AtomicBool::new(false),
+        active_bundled: AtomicUsize::new(0),
+        active_system: AtomicUsize::new(0),
+        last_used: AtomicU8::new(0),
+        fallback_reason: Mutex::new(fallback_reason),
+    }
 }
 
 pub struct PsuedoCon {
     con: HPCON,
+    backend: ConptyBackend,
 }
 
 unsafe impl Send for PsuedoCon {}
@@ -72,15 +157,69 @@ unsafe impl Sync for PsuedoCon {}
 
 impl Drop for PsuedoCon {
     fn drop(&mut self) {
-        unsafe { (CONPTY.ClosePseudoConsole)(self.con) };
+        let state = CONPTY
+            .get()
+            .expect("ConPTY initialized before PTY creation");
+        let funcs = state.funcs(self.backend);
+        unsafe { (funcs.ClosePseudoConsole)(self.con) };
+        state.active(self.backend).fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl ConptyState {
+    fn funcs(&self, backend: ConptyBackend) -> &ConPtyFuncs {
+        match backend {
+            ConptyBackend::Bundled => self.bundled.as_ref().expect("bundled ConPTY is loaded"),
+            ConptyBackend::System => &self.system,
+        }
+    }
+
+    fn active(&self, backend: ConptyBackend) -> &AtomicUsize {
+        match backend {
+            ConptyBackend::Bundled => &self.active_bundled,
+            ConptyBackend::System => &self.active_system,
+        }
     }
 }
 
 impl PsuedoCon {
     pub fn new(size: COORD, input: FileDescriptor, output: FileDescriptor) -> Result<Self, Error> {
+        let state = CONPTY.get_or_init(load_conpty);
+        if state.bundled.is_some() && !state.bundled_disabled.load(Ordering::Acquire) {
+            match Self::create(state.funcs(ConptyBackend::Bundled), size, &input, &output) {
+                Ok(con) => return Ok(Self::record(con, ConptyBackend::Bundled, state)),
+                Err(error) => {
+                    state.bundled_disabled.store(true, Ordering::Release);
+                    *state.fallback_reason.lock().unwrap() =
+                        Some(format!("Bundled ConPTY creation failed: {error:#}"));
+                }
+            }
+        }
+        let con = Self::create(&state.system, size, &input, &output)?;
+        Ok(Self::record(con, ConptyBackend::System, state))
+    }
+
+    fn record(con: HPCON, backend: ConptyBackend, state: &ConptyState) -> Self {
+        state.active(backend).fetch_add(1, Ordering::AcqRel);
+        state.last_used.store(
+            match backend {
+                ConptyBackend::Bundled => 1,
+                ConptyBackend::System => 2,
+            },
+            Ordering::Release,
+        );
+        Self { con, backend }
+    }
+
+    fn create(
+        funcs: &ConPtyFuncs,
+        size: COORD,
+        input: &FileDescriptor,
+        output: &FileDescriptor,
+    ) -> Result<HPCON, Error> {
         let mut con: HPCON = INVALID_HANDLE_VALUE;
         let result = unsafe {
-            (CONPTY.CreatePseudoConsole)(
+            (funcs.CreatePseudoConsole)(
                 size,
                 input.as_raw_handle() as _,
                 output.as_raw_handle() as _,
@@ -95,11 +234,14 @@ impl PsuedoCon {
             "failed to create psuedo console: HRESULT {}",
             result
         );
-        Ok(Self { con })
+        Ok(con)
     }
 
     pub fn resize(&self, size: COORD) -> Result<(), Error> {
-        let result = unsafe { (CONPTY.ResizePseudoConsole)(self.con, size) };
+        let state = CONPTY
+            .get()
+            .expect("ConPTY initialized before PTY creation");
+        let result = unsafe { (state.funcs(self.backend).ResizePseudoConsole)(self.con, size) };
         ensure!(
             result == S_OK,
             "failed to resize console to {}x{}: HRESULT: {}",
@@ -171,5 +313,49 @@ impl PsuedoCon {
         Ok(WinChild {
             proc: Mutex::new(proc),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use filedescriptor::Pipe;
+
+    unsafe extern "C" fn fail_create(
+        _size: COORD,
+        _input: HANDLE,
+        _output: HANDLE,
+        _flags: DWORD,
+        _hpc: *mut HPCON,
+    ) -> HRESULT {
+        0x8000_4005_u32 as HRESULT
+    }
+
+    #[test]
+    fn bundled_creation_failure_uses_system_functions() {
+        let system = ConPtyFuncs::open(Path::new("kernel32.dll")).unwrap();
+        let mut bundled = ConPtyFuncs::open(Path::new("kernel32.dll")).unwrap();
+        bundled.CreatePseudoConsole = fail_create;
+        assert!(CONPTY
+            .set(ConptyState {
+                system,
+                bundled: Some(bundled),
+                bundled_disabled: AtomicBool::new(false),
+                active_bundled: AtomicUsize::new(0),
+                active_system: AtomicUsize::new(0),
+                last_used: AtomicU8::new(0),
+                fallback_reason: Mutex::new(None),
+            })
+            .is_ok());
+
+        let input = Pipe::new().unwrap();
+        let output = Pipe::new().unwrap();
+        let pty = PsuedoCon::new(COORD { X: 80, Y: 24 }, input.read, output.write).unwrap();
+        let status = conpty_status();
+        assert_eq!(status.last_used, Some(ConptyBackend::System));
+        assert_eq!(status.active_system, 1);
+        assert!(status.fallback_reason.unwrap().contains("creation failed"));
+        drop(pty);
+        assert_eq!(conpty_status().active_system, 0);
     }
 }

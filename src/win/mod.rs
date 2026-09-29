@@ -15,6 +15,8 @@ pub mod conpty;
 mod procthreadattr;
 mod psuedocon;
 
+pub use psuedocon::{configure_bundled_conpty, conpty_status, ConptyBackend, ConptyStatus};
+
 use filedescriptor::OwnedHandle;
 
 #[derive(Debug)]
