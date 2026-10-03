@@ -20,3 +20,19 @@ also runs its transport and release-package checks.
 
 When updating the base release, compare `src/win/psuedocon.rs` and
 `src/win/mod.rs` against the new upstream source and rerun these Windows tests.
+
+## Fresh Windows environment expansion
+
+Carry NyaTerm Tauri 1ef75d1bb as a separate patch on top of the ConPTY changes.
+Merge system/user registry values before expanding references, preserving
+case-insensitive keys, PATH concatenation, unknown references and bounded
+cycle handling. Environment values are never traced. Add lossless iter_full_env
+so native shell environment probes can start from the same refreshed snapshot
+instead of overwriting it with stale process variables.
+
+Windows validation: cargo test (12 unit tests and 1 doctest passed); the packaged
+ConPTY integration test remains ignored without NYATERM_CONPTY_TEST_DLL.
+
+Clippy --all-targets on Rust 1.97 reports an existing clippy::uninit_vec error
+in src/win/procthreadattr.rs (unchanged by this series). The check with that
+single baseline lint allowed passes, with existing upstream warnings.

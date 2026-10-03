@@ -39,6 +39,134 @@ impl EnvEntry {
     }
 }
 
+#[cfg(windows)]
+struct RegistryEnvValue {
+    value: OsString,
+    expandable: bool,
+}
+
+#[cfg(windows)]
+fn reg_value_to_env(value: &winreg::RegValue) -> anyhow::Result<RegistryEnvValue> {
+    use std::os::windows::ffi::OsStringExt;
+    use winreg::enums::RegType;
+    use winreg::types::FromRegValue;
+
+    let expandable = value.vtype == RegType::REG_EXPAND_SZ;
+    let value = if expandable {
+        anyhow::ensure!(value.bytes.len() & 1 == 0, "invalid REG_EXPAND_SZ length");
+        let mut wide: Vec<u16> = value
+            .bytes
+            .chunks_exact(2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect();
+        while wide.last() == Some(&0) {
+            wide.pop();
+        }
+        OsString::from_wide(&wide)
+    } else {
+        OsString::from_reg_value(value)?
+    };
+    Ok(RegistryEnvValue { value, expandable })
+}
+
+#[cfg(windows)]
+fn expand_environment_value(
+    value: &OsStr,
+    env: &BTreeMap<OsString, EnvEntry>,
+    active: &mut Vec<OsString>,
+    depth: usize,
+) -> OsString {
+    use std::os::windows::ffi::OsStringExt;
+
+    const MAX_DEPTH: usize = 32;
+    let wide: Vec<u16> = value.encode_wide().collect();
+    let mut result = Vec::with_capacity(wide.len());
+    let mut pos = 0;
+    while pos < wide.len() {
+        if wide[pos] == b'%' as u16 {
+            if let Some(end) = (pos + 1..wide.len()).find(|&i| wide[i] == b'%' as u16) {
+                let key = EnvEntry::map_key(OsString::from_wide(&wide[pos + 1..end]));
+                if depth < MAX_DEPTH && !active.contains(&key) {
+                    if let Some(entry) = env.get(&key) {
+                        active.push(key);
+                        result.extend(
+                            expand_environment_value(&entry.value, env, active, depth + 1)
+                                .encode_wide(),
+                        );
+                        active.pop();
+                        pos = end + 1;
+                        continue;
+                    }
+                }
+                result.extend_from_slice(&wide[pos..=end]);
+                pos = end + 1;
+                continue;
+            }
+        }
+        result.push(wide[pos]);
+        pos += 1;
+    }
+    OsString::from_wide(&result)
+}
+
+#[cfg(windows)]
+fn merge_windows_env(
+    mut env: BTreeMap<OsString, EnvEntry>,
+    system: impl IntoIterator<Item = (OsString, RegistryEnvValue)>,
+    user: impl IntoIterator<Item = (OsString, RegistryEnvValue)>,
+) -> BTreeMap<OsString, EnvEntry> {
+    let mut expandable = BTreeMap::new();
+
+    for (name, value) in system {
+        if EnvEntry::map_key(name.clone()) == OsStr::new("username") {
+            continue;
+        }
+        let key = EnvEntry::map_key(name.clone());
+        expandable.insert(key.clone(), value.expandable);
+        env.insert(
+            key,
+            EnvEntry {
+                is_from_base_env: true,
+                preferred_key: name,
+                value: value.value,
+            },
+        );
+    }
+
+    for (name, value) in user {
+        let key = EnvEntry::map_key(name.clone());
+        let mut raw_value = value.value;
+        let mut needs_expansion = value.expandable;
+        if key == OsStr::new("path") {
+            if let Some(entry) = env.get(&key) {
+                let mut combined = entry.value.clone();
+                combined.push(";");
+                combined.push(raw_value);
+                raw_value = combined;
+                needs_expansion |= expandable.get(&key).copied().unwrap_or(false);
+            }
+        }
+        expandable.insert(key.clone(), needs_expansion);
+        env.insert(
+            key,
+            EnvEntry {
+                is_from_base_env: true,
+                preferred_key: name,
+                value: raw_value,
+            },
+        );
+    }
+
+    let raw_env = env.clone();
+    for (key, entry) in &mut env {
+        if expandable.get(key) == Some(&true) {
+            entry.value =
+                expand_environment_value(&entry.value, &raw_env, &mut vec![key.clone()], 0);
+        }
+    }
+    env
+}
+
 #[cfg(unix)]
 fn get_shell() -> String {
     use nix::unistd::{access, AccessFlags};
@@ -103,94 +231,29 @@ fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
 
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStringExt;
-        use winapi::um::processenv::ExpandEnvironmentStringsW;
-        use winreg::enums::{RegType, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
-        use winreg::types::FromRegValue;
-        use winreg::{RegKey, RegValue};
+        use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+        use winreg::RegKey;
 
-        fn reg_value_to_string(value: &RegValue) -> anyhow::Result<OsString> {
-            match value.vtype {
-                RegType::REG_EXPAND_SZ => {
-                    let src = unsafe {
-                        std::slice::from_raw_parts(
-                            value.bytes.as_ptr() as *const u16,
-                            value.bytes.len() / 2,
-                        )
-                    };
-                    let size =
-                        unsafe { ExpandEnvironmentStringsW(src.as_ptr(), std::ptr::null_mut(), 0) };
-                    let mut buf = vec![0u16; size as usize + 1];
-                    unsafe {
-                        ExpandEnvironmentStringsW(src.as_ptr(), buf.as_mut_ptr(), buf.len() as u32)
-                    };
-
-                    let mut buf = buf.as_slice();
-                    while let Some(0) = buf.last() {
-                        buf = &buf[0..buf.len() - 1];
-                    }
-                    Ok(OsString::from_wide(buf))
-                }
-                _ => Ok(OsString::from_reg_value(value)?),
-            }
-        }
-
+        let mut system = Vec::new();
         if let Ok(sys_env) = RegKey::predef(HKEY_LOCAL_MACHINE)
             .open_subkey("System\\CurrentControlSet\\Control\\Session Manager\\Environment")
         {
-            for res in sys_env.enum_values() {
-                if let Ok((name, value)) = res {
-                    if name.to_ascii_lowercase() == "username" {
-                        continue;
-                    }
-                    if let Ok(value) = reg_value_to_string(&value) {
-                        log::trace!("adding SYS env: {:?} {:?}", name, value);
-                        env.insert(
-                            EnvEntry::map_key(name.clone().into()),
-                            EnvEntry {
-                                is_from_base_env: true,
-                                preferred_key: name.into(),
-                                value,
-                            },
-                        );
-                    }
+            for (name, value) in sys_env.enum_values().flatten() {
+                if let Ok(value) = reg_value_to_env(&value) {
+                    system.push((name.into(), value));
                 }
             }
         }
 
+        let mut user = Vec::new();
         if let Ok(sys_env) = RegKey::predef(HKEY_CURRENT_USER).open_subkey("Environment") {
-            for res in sys_env.enum_values() {
-                if let Ok((name, value)) = res {
-                    if let Ok(value) = reg_value_to_string(&value) {
-                        // Merge the system and user paths together
-                        let value = if name.to_ascii_lowercase() == "path" {
-                            match env.get(&EnvEntry::map_key(name.clone().into())) {
-                                Some(entry) => {
-                                    let mut result = OsString::new();
-                                    result.push(&entry.value);
-                                    result.push(";");
-                                    result.push(&value);
-                                    result
-                                }
-                                None => value,
-                            }
-                        } else {
-                            value
-                        };
-
-                        log::trace!("adding USER env: {:?} {:?}", name, value);
-                        env.insert(
-                            EnvEntry::map_key(name.clone().into()),
-                            EnvEntry {
-                                is_from_base_env: true,
-                                preferred_key: name.into(),
-                                value,
-                            },
-                        );
-                    }
+            for (name, value) in sys_env.enum_values().flatten() {
+                if let Ok(value) = reg_value_to_env(&value) {
+                    user.push((name.into(), value));
                 }
             }
         }
+        env = merge_windows_env(env, system, user);
     }
 
     env
@@ -373,6 +436,13 @@ impl CommandBuilder {
                 }
             },
         )
+    }
+
+    /// Iterate every environment entry without losing non-Unicode values.
+    pub fn iter_full_env(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
+        self.envs
+            .values()
+            .map(|entry| (entry.preferred_key.as_os_str(), entry.value.as_os_str()))
     }
 
     pub fn iter_full_env_as_str(&self) -> impl Iterator<Item = (&str, &str)> {
@@ -819,5 +889,161 @@ mod tests {
 
         cmd.env_remove("cARGO_pKG_aUTHORS");
         assert!(cmd.get_env("CARGO_PKG_AUTHORS").is_none());
+    }
+
+    #[cfg(windows)]
+    fn test_windows_env(
+        process: &[(&str, &str)],
+        system: &[(&str, &str, bool)],
+        user: &[(&str, &str, bool)],
+    ) -> BTreeMap<OsString, EnvEntry> {
+        let process = process
+            .iter()
+            .map(|(name, value)| {
+                (
+                    EnvEntry::map_key((*name).into()),
+                    EnvEntry {
+                        is_from_base_env: true,
+                        preferred_key: (*name).into(),
+                        value: (*value).into(),
+                    },
+                )
+            })
+            .collect();
+        let values = |entries: &[(&str, &str, bool)]| {
+            entries
+                .iter()
+                .map(|(name, value, expandable)| {
+                    (
+                        (*name).into(),
+                        RegistryEnvValue {
+                            value: (*value).into(),
+                            expandable: *expandable,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        merge_windows_env(process, values(system), values(user))
+    }
+
+    #[cfg(windows)]
+    fn env_value<'a>(env: &'a BTreeMap<OsString, EnvEntry>, name: &str) -> &'a OsStr {
+        &env[&EnvEntry::map_key(name.into())].value
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_user_overrides_system_and_process() {
+        let env = test_windows_env(
+            &[("JAVA_HOME", "C:\\jdk8")],
+            &[("JAVA_HOME", "C:\\jdk11", false)],
+            &[("JAVA_HOME", "C:\\jdk17", false)],
+        );
+        assert_eq!(env_value(&env, "java_home"), OsStr::new("C:\\jdk17"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_expand_path_with_fresh_user_variable() {
+        let env = test_windows_env(
+            &[("JAVA_HOME", "C:\\jdk8")],
+            &[("Path", "C:\\Windows\\System32", false)],
+            &[
+                ("JAVA_HOME", "C:\\jdk17", false),
+                ("Path", "%JAVA_HOME%\\bin", true),
+            ],
+        );
+        assert_eq!(env_value(&env, "JAVA_HOME"), OsStr::new("C:\\jdk17"));
+        assert_eq!(
+            env_value(&env, "PATH"),
+            OsStr::new("C:\\Windows\\System32;C:\\jdk17\\bin")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_expand_case_insensitive_variable_name() {
+        let env = test_windows_env(
+            &[],
+            &[],
+            &[
+                ("JAVA_HOME", "C:\\jdk17", false),
+                ("Path", "%java_home%\\bin", true),
+            ],
+        );
+        assert_eq!(env_value(&env, "PATH"), OsStr::new("C:\\jdk17\\bin"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_expand_system_path_with_fresh_user_variable() {
+        let env = test_windows_env(
+            &[("JAVA_HOME", "C:\\jdk8")],
+            &[("Path", "C:\\Windows\\System32;%JAVA_HOME%\\bin", true)],
+            &[
+                ("JAVA_HOME", "C:\\jdk17", false),
+                ("Path", "C:\\Tools", false),
+            ],
+        );
+        assert_eq!(
+            env_value(&env, "PATH"),
+            OsStr::new("C:\\Windows\\System32;C:\\jdk17\\bin;C:\\Tools")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_expand_nested_variables() {
+        let env = test_windows_env(&[], &[], &[("A", "%B%", true), ("B", "C:\\foo", false)]);
+        assert_eq!(env_value(&env, "A"), OsStr::new("C:\\foo"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_expand_cycle_keeps_reference() {
+        let env = test_windows_env(&[], &[], &[("A", "%B%", true), ("B", "%A%", true)]);
+        assert_eq!(env_value(&env, "A"), OsStr::new("%A%"));
+        assert_eq!(env_value(&env, "B"), OsStr::new("%B%"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_expand_unknown_keeps_reference() {
+        let env = test_windows_env(&[], &[], &[("Path", "%UNKNOWN%\\bin", true)]);
+        assert_eq!(env_value(&env, "PATH"), OsStr::new("%UNKNOWN%\\bin"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_expand_with_updated_non_java_variable() {
+        let env = test_windows_env(
+            &[("NYATERM_ENV_TEST", "C:\\test-old")],
+            &[],
+            &[
+                ("NYATERM_ENV_TEST", "C:\\test-new", false),
+                ("Path", "%NYATERM_ENV_TEST%\\bin", true),
+            ],
+        );
+        assert_eq!(env_value(&env, "PATH"), OsStr::new("C:\\test-new\\bin"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_reg_expand_sz_stays_raw_until_merge() {
+        use std::os::windows::ffi::OsStrExt;
+        use winreg::enums::RegType;
+
+        let mut bytes = Vec::new();
+        for code_unit in OsStr::new("%NYATERM_ENV_TEST%\\bin\0").encode_wide() {
+            bytes.extend(code_unit.to_le_bytes());
+        }
+        let value = reg_value_to_env(&winreg::RegValue {
+            bytes,
+            vtype: RegType::REG_EXPAND_SZ,
+        })
+        .unwrap();
+        assert!(value.expandable);
+        assert_eq!(value.value, OsStr::new("%NYATERM_ENV_TEST%\\bin"));
     }
 }
