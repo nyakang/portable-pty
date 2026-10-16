@@ -36,3 +36,14 @@ ConPTY integration test remains ignored without NYATERM_CONPTY_TEST_DLL.
 Clippy --all-targets on Rust 1.97 reports an existing clippy::uninit_vec error
 in src/win/procthreadattr.rs (unchanged by this series). The check with that
 single baseline lint allowed passes, with existing upstream warnings.
+
+## 2026-10-17 fallible process lifecycle
+
+Share Windows process handles across killers instead of infallible duplication.
+Propagate poisoned locks, query, wait, duplication and termination errors; fix
+TerminateProcess success detection. Waiter threads use fallible spawning and own
+their handle until completion.
+
+Windows validation: cargo test --offline passed 15 unit tests and one doctest,
+including restricted process handles and injected poisoned locks. The prepared
+ConPTY package test is ignored without NYATERM_CONPTY_TEST_DLL.

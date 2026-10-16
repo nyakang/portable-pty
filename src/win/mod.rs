@@ -3,7 +3,7 @@ use anyhow::Context as _;
 use std::io::{Error as IoError, Result as IoResult};
 use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use winapi::shared::minwindef::DWORD;
 use winapi::um::minwinbase::STILL_ACTIVE;
@@ -21,13 +21,16 @@ use filedescriptor::OwnedHandle;
 
 #[derive(Debug)]
 pub struct WinChild {
-    proc: Mutex<OwnedHandle>,
+    proc: Arc<Mutex<OwnedHandle>>,
 }
 
 impl WinChild {
     fn is_complete(&mut self) -> IoResult<Option<ExitStatus>> {
         let mut status: DWORD = 0;
-        let proc = self.proc.lock().unwrap().try_clone().unwrap();
+        let proc = self
+            .proc
+            .lock()
+            .map_err(|_| IoError::other("process handle lock poisoned"))?;
         let res = unsafe { GetExitCodeProcess(proc.as_raw_handle() as _, &mut status) };
         if res != 0 {
             if status == STILL_ACTIVE {
@@ -36,15 +39,18 @@ impl WinChild {
                 Ok(Some(ExitStatus::with_exit_code(status)))
             }
         } else {
-            Ok(None)
+            Err(IoError::last_os_error())
         }
     }
 
     fn do_kill(&mut self) -> IoResult<()> {
-        let proc = self.proc.lock().unwrap().try_clone().unwrap();
+        let proc = self
+            .proc
+            .lock()
+            .map_err(|_| IoError::other("process handle lock poisoned"))?;
         let res = unsafe { TerminateProcess(proc.as_raw_handle() as _, 1) };
         let err = IoError::last_os_error();
-        if res != 0 {
+        if res == 0 {
             Err(err)
         } else {
             Ok(())
@@ -54,26 +60,30 @@ impl WinChild {
 
 impl ChildKiller for WinChild {
     fn kill(&mut self) -> IoResult<()> {
-        self.do_kill().ok();
-        Ok(())
+        self.do_kill()
     }
 
     fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
-        let proc = self.proc.lock().unwrap().try_clone().unwrap();
-        Box::new(WinChildKiller { proc })
+        Box::new(WinChildKiller {
+            proc: Arc::clone(&self.proc),
+        })
     }
 }
 
 #[derive(Debug)]
 pub struct WinChildKiller {
-    proc: OwnedHandle,
+    proc: Arc<Mutex<OwnedHandle>>,
 }
 
 impl ChildKiller for WinChildKiller {
     fn kill(&mut self) -> IoResult<()> {
-        let res = unsafe { TerminateProcess(self.proc.as_raw_handle() as _, 1) };
+        let proc = self
+            .proc
+            .lock()
+            .map_err(|_| IoError::other("process handle lock poisoned"))?;
+        let res = unsafe { TerminateProcess(proc.as_raw_handle() as _, 1) };
         let err = IoError::last_os_error();
-        if res != 0 {
+        if res == 0 {
             Err(err)
         } else {
             Ok(())
@@ -81,8 +91,9 @@ impl ChildKiller for WinChildKiller {
     }
 
     fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
-        let proc = self.proc.try_clone().unwrap();
-        Box::new(WinChildKiller { proc })
+        Box::new(WinChildKiller {
+            proc: Arc::clone(&self.proc),
+        })
     }
 }
 
@@ -92,12 +103,17 @@ impl Child for WinChild {
     }
 
     fn wait(&mut self) -> IoResult<ExitStatus> {
-        if let Ok(Some(status)) = self.try_wait() {
+        if let Some(status) = self.try_wait()? {
             return Ok(status);
         }
-        let proc = self.proc.lock().unwrap().try_clone().unwrap();
-        unsafe {
-            WaitForSingleObject(proc.as_raw_handle() as _, INFINITE);
+        let proc = self
+            .proc
+            .lock()
+            .map_err(|_| IoError::other("process handle lock poisoned"))?
+            .try_clone()
+            .map_err(IoError::other)?;
+        if unsafe { WaitForSingleObject(proc.as_raw_handle() as _, INFINITE) } == u32::MAX {
+            return Err(IoError::last_os_error());
         }
         let mut status: DWORD = 0;
         let res = unsafe { GetExitCodeProcess(proc.as_raw_handle() as _, &mut status) };
@@ -109,7 +125,8 @@ impl Child for WinChild {
     }
 
     fn process_id(&self) -> Option<u32> {
-        let res = unsafe { GetProcessId(self.proc.lock().unwrap().as_raw_handle() as _) };
+        let proc = self.proc.lock().ok()?;
+        let res = unsafe { GetProcessId(proc.as_raw_handle() as _) };
         if res == 0 {
             None
         } else {
@@ -118,7 +135,7 @@ impl Child for WinChild {
     }
 
     fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
-        let proc = self.proc.lock().unwrap();
+        let proc = self.proc.lock().ok()?;
         Some(proc.as_raw_handle())
     }
 }
@@ -134,18 +151,78 @@ impl std::future::Future for WinChild {
                 struct PassRawHandleToWaiterThread(pub RawHandle);
                 unsafe impl Send for PassRawHandleToWaiterThread {}
 
-                let proc = self.proc.lock().unwrap().try_clone()?;
+                let proc = self
+                    .proc
+                    .lock()
+                    .map_err(|_| IoError::other("process handle lock poisoned"))?
+                    .try_clone()?;
                 let handle = PassRawHandleToWaiterThread(proc.as_raw_handle());
 
                 let waker = cx.waker().clone();
-                std::thread::spawn(move || {
-                    unsafe {
-                        WaitForSingleObject(handle.0 as _, INFINITE);
-                    }
-                    waker.wake();
-                });
+                std::thread::Builder::new()
+                    .name("pty-process-wait".into())
+                    .spawn(move || {
+                        unsafe {
+                            WaitForSingleObject(handle.0 as _, INFINITE);
+                        }
+                        waker.wake();
+                        drop(proc);
+                    })?;
                 Poll::Pending
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod process_error_tests {
+    use super::WinChild;
+    use crate::{Child, ChildKiller};
+    use filedescriptor::OwnedHandle;
+    use std::os::windows::io::FromRawHandle;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn query_and_termination_failures_are_errors() {
+        // A real process handle without query or termination rights deterministically
+        // exercises access-denied paths without invalid handles or resource exhaustion.
+        let handle = unsafe {
+            winapi::um::processthreadsapi::OpenProcess(
+                winapi::um::winnt::SYNCHRONIZE,
+                0,
+                winapi::um::processthreadsapi::GetCurrentProcessId(),
+            )
+        };
+        assert!(!handle.is_null());
+        let mut child = WinChild {
+            proc: Arc::new(Mutex::new(unsafe {
+                OwnedHandle::from_raw_handle(handle.cast())
+            })),
+        };
+        assert!(child.try_wait().is_err());
+        assert!(child.kill().is_err());
+        assert!(child.clone_killer().kill().is_err());
+    }
+
+    #[test]
+    fn poisoned_process_locks_do_not_panic() {
+        let handle = unsafe {
+            winapi::um::synchapi::CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null())
+        };
+        assert!(!handle.is_null());
+        let proc = Arc::new(Mutex::new(unsafe {
+            OwnedHandle::from_raw_handle(handle.cast())
+        }));
+        let poisoned = Arc::clone(&proc);
+        assert!(std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("injected lock failure");
+        })
+        .join()
+        .is_err());
+        let mut child = WinChild { proc };
+        assert!(child.try_wait().is_err());
+        assert!(child.kill().is_err());
+        assert!(child.clone_killer().kill().is_err());
     }
 }

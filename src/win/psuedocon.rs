@@ -311,7 +311,7 @@ impl PsuedoCon {
         let proc = unsafe { OwnedHandle::from_raw_handle(pi.hProcess as _) };
 
         Ok(WinChild {
-            proc: Mutex::new(proc),
+            proc: std::sync::Arc::new(Mutex::new(proc)),
         })
     }
 }
