@@ -48,14 +48,30 @@ impl WinChild {
             .proc
             .lock()
             .map_err(|_| IoError::other("process handle lock poisoned"))?;
-        let res = unsafe { TerminateProcess(proc.as_raw_handle() as _, 1) };
-        let err = IoError::last_os_error();
-        if res == 0 {
-            Err(err)
-        } else {
-            Ok(())
-        }
+        terminate_process(&proc)
     }
+}
+
+// A process can exit between querying it and TerminateProcess. Treat that
+// race as successful cleanup while preserving real query/termination errors.
+fn terminate_process(proc: &OwnedHandle) -> IoResult<()> {
+    let mut status = 0;
+    if unsafe { GetExitCodeProcess(proc.as_raw_handle() as _, &mut status) } == 0 {
+        return Err(IoError::last_os_error());
+    }
+    if status != STILL_ACTIVE {
+        return Ok(());
+    }
+    if unsafe { TerminateProcess(proc.as_raw_handle() as _, 1) } != 0 {
+        return Ok(());
+    }
+    let error = IoError::last_os_error();
+    if unsafe { GetExitCodeProcess(proc.as_raw_handle() as _, &mut status) } != 0
+        && status != STILL_ACTIVE
+    {
+        return Ok(());
+    }
+    Err(error)
 }
 
 impl ChildKiller for WinChild {
@@ -81,13 +97,7 @@ impl ChildKiller for WinChildKiller {
             .proc
             .lock()
             .map_err(|_| IoError::other("process handle lock poisoned"))?;
-        let res = unsafe { TerminateProcess(proc.as_raw_handle() as _, 1) };
-        let err = IoError::last_os_error();
-        if res == 0 {
-            Err(err)
-        } else {
-            Ok(())
-        }
+        terminate_process(&proc)
     }
 
     fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
@@ -202,6 +212,32 @@ mod process_error_tests {
         assert!(child.try_wait().is_err());
         assert!(child.kill().is_err());
         assert!(child.clone_killer().kill().is_err());
+    }
+
+    #[test]
+    fn termination_succeeds_and_is_idempotent_after_exit() {
+        use std::os::windows::io::{AsHandle, IntoRawHandle};
+        use std::os::windows::process::CommandExt;
+        let mut process = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "pause"])
+            .stdin(std::process::Stdio::piped())
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .unwrap();
+        let handle = process
+            .as_handle()
+            .try_clone_to_owned()
+            .unwrap()
+            .into_raw_handle();
+        let mut child = WinChild {
+            proc: Arc::new(Mutex::new(unsafe { OwnedHandle::from_raw_handle(handle) })),
+        };
+        let mut killer = child.clone_killer();
+        killer.kill().unwrap();
+        child.wait().unwrap();
+        child.kill().unwrap();
+        killer.kill().unwrap();
+        process.wait().unwrap();
     }
 
     #[test]

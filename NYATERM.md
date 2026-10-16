@@ -60,3 +60,15 @@ ConPTY lock failures return errors.
 Windows validation: cargo test --offline passed 15 unit tests and one doctest;
 a full pipe with a blocked 4 MiB write is cancelled within one second. Unix
 execution and prepared package-backed ConPTY validation remain pending.
+
+## 2026-10-17 idempotent cleanup and initialization errors
+
+Treat an already exited Windows process, including an exit racing termination,
+as successful cleanup. Preserve query and termination errors for live processes.
+Load system ConPTY fallibly and return initialization/status-lock failures instead
+of panicking during connection creation. Remaining ConPTY expects describe
+invariants established by successful construction.
+
+Windows validation: cargo test --offline passed 16 unit tests and one doctest,
+including successful termination and repeated kill after exit. The prepared
+ConPTY package integration test remains ignored without NYATERM_CONPTY_TEST_DLL.

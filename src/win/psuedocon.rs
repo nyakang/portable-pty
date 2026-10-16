@@ -1,7 +1,7 @@
 use super::WinChild;
 use crate::cmdbuilder::CommandBuilder;
 use crate::win::procthreadattr::ProcThreadAttributeList;
-use anyhow::{bail, ensure, Error};
+use anyhow::{bail, ensure, Context as _, Error};
 use filedescriptor::{FileDescriptor, OwnedHandle};
 use shared_library::shared_library;
 use std::ffi::OsString;
@@ -99,14 +99,20 @@ pub fn conpty_status() -> ConptyStatus {
         active_bundled: state.active_bundled.load(Ordering::Acquire),
         active_system: state.active_system.load(Ordering::Acquire),
         last_used,
-        fallback_reason: state.fallback_reason.lock().unwrap().clone(),
+        fallback_reason: state
+            .fallback_reason
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone(),
     }
 }
 
-fn load_conpty() -> ConptyState {
-    let system = ConPtyFuncs::open(Path::new("kernel32.dll")).expect(
-        "this system does not support conpty.  Windows 10 October 2018 or newer is required",
-    );
+fn load_conpty() -> Result<ConptyState, Error> {
+    let system = ConPtyFuncs::open(Path::new("kernel32.dll")).map_err(|error| {
+        anyhow::anyhow!(
+            "ConPTY is unavailable (Windows 10 October 2018 or newer required): {error:?}"
+        )
+    })?;
     let (bundled, fallback_reason) = match BUNDLED_PATH.get() {
         Some(path) => {
             let host_arches: &[&str] = match std::env::consts::ARCH {
@@ -136,7 +142,7 @@ fn load_conpty() -> ConptyState {
         }
         None => (None, None),
     };
-    ConptyState {
+    Ok(ConptyState {
         system,
         bundled,
         bundled_disabled: AtomicBool::new(false),
@@ -144,7 +150,7 @@ fn load_conpty() -> ConptyState {
         active_system: AtomicUsize::new(0),
         last_used: AtomicU8::new(0),
         fallback_reason: Mutex::new(fallback_reason),
-    }
+    })
 }
 
 pub struct PsuedoCon {
@@ -184,13 +190,20 @@ impl ConptyState {
 
 impl PsuedoCon {
     pub fn new(size: COORD, input: FileDescriptor, output: FileDescriptor) -> Result<Self, Error> {
-        let state = CONPTY.get_or_init(load_conpty);
+        if CONPTY.get().is_none() {
+            // Failed initialization must return an error and remain retryable.
+            let _ = CONPTY.set(load_conpty()?);
+        }
+        let state = CONPTY.get().context("ConPTY initialization failed")?;
         if state.bundled.is_some() && !state.bundled_disabled.load(Ordering::Acquire) {
             match Self::create(state.funcs(ConptyBackend::Bundled), size, &input, &output) {
                 Ok(con) => return Ok(Self::record(con, ConptyBackend::Bundled, state)),
                 Err(error) => {
                     state.bundled_disabled.store(true, Ordering::Release);
-                    *state.fallback_reason.lock().unwrap() =
+                    *state
+                        .fallback_reason
+                        .lock()
+                        .map_err(|_| IoError::other("ConPTY status lock poisoned"))? =
                         Some(format!("Bundled ConPTY creation failed: {error:#}"));
                 }
             }
