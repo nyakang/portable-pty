@@ -55,7 +55,9 @@ pub mod unix;
 #[cfg(windows)]
 pub mod win;
 
+mod cancellable_writer;
 pub mod serial;
+pub use cancellable_writer::{CancellableWriter, WriteCancellation};
 
 /// Represents the size of the visible display area in the pty
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +102,12 @@ pub trait MasterPty: Downcast + Send {
     /// Dropping the writer will send EOF to the slave end.
     /// It is invalid to take the writer more than once.
     fn take_writer(&self) -> Result<Box<dyn std::io::Write + Send>, Error>;
+
+    /// Take a writer whose blocked writes can be cancelled during shutdown.
+    /// Backends without this facility return an error without consuming a writer.
+    fn take_cancellable_writer(&self) -> Result<(CancellableWriter, WriteCancellation), Error> {
+        anyhow::bail!("this PTY backend does not support cancellable writes")
+    }
 
     /// If applicable to the type of the tty, return the local process id
     /// of the process group or session leader

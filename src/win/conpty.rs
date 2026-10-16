@@ -83,34 +83,62 @@ pub struct ConPtySlavePty {
 
 impl MasterPty for ConPtyMasterPty {
     fn resize(&self, size: PtySize) -> anyhow::Result<()> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ConPTY lock poisoned"))?;
         inner.resize(size.rows, size.cols, size.pixel_width, size.pixel_height)
     }
 
     fn get_size(&self) -> Result<PtySize, Error> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ConPTY lock poisoned"))?;
         Ok(inner.size.clone())
     }
 
     fn try_clone_reader(&self) -> anyhow::Result<Box<dyn std::io::Read + Send>> {
-        Ok(Box::new(self.inner.lock().unwrap().readable.try_clone()?))
+        Ok(Box::new(
+            self.inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("ConPTY lock poisoned"))?
+                .readable
+                .try_clone()?,
+        ))
     }
 
     fn take_writer(&self) -> anyhow::Result<Box<dyn std::io::Write + Send>> {
         Ok(Box::new(
             self.inner
                 .lock()
-                .unwrap()
+                .map_err(|_| anyhow::anyhow!("ConPTY lock poisoned"))?
                 .writable
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("writer already taken"))?,
         ))
     }
+
+    fn take_cancellable_writer(
+        &self,
+    ) -> anyhow::Result<(crate::CancellableWriter, crate::WriteCancellation)> {
+        let writer = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ConPTY lock poisoned"))?
+            .writable
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("writer already taken"))?;
+        crate::CancellableWriter::new(writer)
+    }
 }
 
 impl SlavePty for ConPtySlavePty {
     fn spawn_command(&self, cmd: CommandBuilder) -> anyhow::Result<Box<dyn Child + Send + Sync>> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ConPTY lock poisoned"))?;
         let child = inner.con.spawn_command(cmd)?;
         Ok(Box::new(child))
     }

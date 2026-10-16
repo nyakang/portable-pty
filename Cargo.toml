@@ -118,6 +118,7 @@ features = [
     "fileapi",
     "namedpipeapi",
     "synchapi",
+    "ioapiset",
 ]
 
 [target."cfg(windows)".dependencies.winreg]

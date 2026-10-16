@@ -47,3 +47,16 @@ their handle until completion.
 Windows validation: cargo test --offline passed 15 unit tests and one doctest,
 including restricted process handles and injected poisoned locks. The prepared
 ConPTY package test is ignored without NYATERM_CONPTY_TEST_DLL.
+
+## 2026-10-17 cancellable PTY writes
+
+Keep take_writer compatible and add take_cancellable_writer with an explicit
+stop handle. Windows registers the writing thread for CancelSynchronousIo;
+callers repeat cancellation until completion to cover the native-entry race.
+Unix uses nonblocking writes and short poll waits. Stopping prevents future
+writes, and writer destruction never performs blocking EOT or flush writes.
+ConPTY lock failures return errors.
+
+Windows validation: cargo test --offline passed 15 unit tests and one doctest;
+a full pipe with a blocked 4 MiB write is cancelled within one second. Unix
+execution and prepared package-backed ConPTY validation remain pending.

@@ -92,15 +92,32 @@ impl std::ops::DerefMut for PtyFd {
 
 impl Read for PtyFd {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
-        match self.0.read(buf) {
-            Err(ref e) if e.raw_os_error() == Some(libc::EIO) => {
-                // EIO indicates that the slave pty has been closed.
-                // Treat this as EOF so that std::io::Read::read_to_string
-                // and similar functions gracefully terminate when they
-                // encounter this condition
-                Ok(0)
+        loop {
+            match self.0.read(buf) {
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // The cancellable writer shares this open file description.
+                    // Preserve blocking reader semantics after enabling O_NONBLOCK.
+                    let mut poll = libc::pollfd {
+                        fd: self.0.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    if unsafe { libc::poll(&mut poll, 1, -1) } < 0 {
+                        let error = io::Error::last_os_error();
+                        if error.kind() != io::ErrorKind::Interrupted {
+                            return Err(error);
+                        }
+                    }
+                }
+                Err(ref e) if e.raw_os_error() == Some(libc::EIO) => {
+                    // EIO indicates that the slave pty has been closed.
+                    // Treat this as EOF so that std::io::Read::read_to_string
+                    // and similar functions gracefully terminate when they
+                    // encounter this condition
+                    return Ok(0);
+                }
+                x => return x,
             }
-            x => x,
         }
     }
 }
@@ -365,6 +382,17 @@ impl MasterPty for UnixMasterPty {
 
     fn as_raw_fd(&self) -> Option<RawFd> {
         Some(self.fd.0.as_raw_fd())
+    }
+
+    fn take_cancellable_writer(
+        &self,
+    ) -> anyhow::Result<(crate::CancellableWriter, crate::WriteCancellation)> {
+        if *self.took_writer.borrow() {
+            anyhow::bail!("cannot take writer more than once");
+        }
+        let result = crate::CancellableWriter::new(self.fd.try_clone()?)?;
+        *self.took_writer.borrow_mut() = true;
+        Ok(result)
     }
 
     fn tty_name(&self) -> Option<PathBuf> {
