@@ -72,3 +72,8 @@ invariants established by successful construction.
 Windows validation: cargo test --offline passed 16 unit tests and one doctest,
 including successful termination and repeated kill after exit. The prepared
 ConPTY package integration test remains ignored without NYATERM_CONPTY_TEST_DLL.
+
+Additional Windows validation (2026-10-17): the consuming workspace provided the
+prepared x64 ConPTY package. With NYATERM_CONPTY_TEST_DLL pointing to its
+conpty.dll, cargo test --offline --test conpty_backend -- --ignored passed,
+covering bundled selection, DLL/host fallback and active-count cleanup.
